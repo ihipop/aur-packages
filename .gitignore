@@ -1,0 +1,11 @@
+# Arch Linux 构建目录
+**/pkg/
+**/src/
+
+*.AppImage
+*.tar.gz
+*.tar.xz
+*.tar.zst
+*.pkg.tar.*
+
+*.log

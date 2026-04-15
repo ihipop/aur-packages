@@ -1,0 +1,122 @@
+name: Check and Update AUR Packages
+
+on:
+  schedule:
+    - cron: "0 1 * * 1" # Weekly on Monday at 09:00 UTC+8 (01:00 UTC)
+  workflow_dispatch:
+
+jobs:
+  check-update:
+    runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1 # 顺序执行
+      matrix:
+        package:
+          - name: proxyman-bin
+            repo: ProxymanApp/proxyman-windows-linux
+    defaults:
+      run:
+        working-directory: ./${{ matrix.package.name }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          # 强制 ref: master 确保每一个 Job 开始前都通过 fetch 获取最新的 HEAD，避免 Push 冲突。
+          ref: master
+
+
+      - name: Install system dependencies
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring ca-certificates
+          pacman -Syu --noconfirm git openssh curl jq binutils fakeroot pacman-contrib sudo
+
+      - name: Prepare build user
+        run: |
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
+
+      - name: Check for new version
+        id: check
+        run: |
+          LATEST_VER=$(curl -s https://api.github.com/repos/${{ matrix.package.repo }}/releases/latest | jq -r .tag_name)
+          if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" == "null" ]; then
+            echo "Error: Could not fetch latest version from ${{ matrix.package.repo }}"
+            exit 1
+          fi
+          
+          LATEST_VER=${LATEST_VER#[vV]}
+          
+          LOCAL_VER=$(grep -P '^\s*pkgver\s*=\s*' .SRCINFO | sed 's/.*= //')
+          echo "Latest version found: $LATEST_VER"
+          echo "Local version: $LOCAL_VER"
+
+          
+          echo "latest=$LATEST_VER" >> $GITHUB_OUTPUT
+          if [ "$LATEST_VER" != "$LOCAL_VER" ]; then
+            echo "update_needed=true" >> $GITHUB_OUTPUT
+          else
+            echo "update_needed=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Update PKGBUILD and .SRCINFO
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          sed -i "s/^pkgver=.*/pkgver=${{ steps.check.outputs.latest }}/" PKGBUILD
+          sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
+          
+          chown -R builder .
+          sudo -u builder updpkgsums
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+
+      - name: Setup SSH for AUR
+        if: steps.check.outputs.update_needed == 'true'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Setup SSH Known Hosts
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan -t ed25519 aur.archlinux.org >> ~/.ssh/known_hosts
+          ssh-keyscan -t rsa aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Commit and Push to GitHub and AUR
+        if: steps.check.outputs.update_needed == 'true'
+        run: |
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          git config --global --add safe.directory '*'
+
+          git add PKGBUILD .SRCINFO
+          # if 
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "chore(${{ matrix.package.name }}): update to ${{ steps.check.outputs.latest }}"
+            
+            # 以防万一 pull --rebase 保底
+            git pull --rebase origin master
+            git push origin master
+          fi
+          
+          # push to aur
+          AUR_CLONE_DIR="/tmp/aur-repo-${{ matrix.package.name }}"
+          echo "Cloning AUR repository for ${{ matrix.package.name }}..."
+          git clone ssh://aur@aur.archlinux.org/${{ matrix.package.name }}.git $AUR_CLONE_DIR
+          
+          echo "Copying files to AUR repository..."
+          git ls-files -z -c -o --exclude-standard | xargs -0 -r cp -v -t "$AUR_CLONE_DIR/"
+          
+          echo "Pushing to AUR..."
+          cd $AUR_CLONE_DIR
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          git add -A
+          
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "Update to ${{ steps.check.outputs.latest }}"
+            git push origin master
+          fi
