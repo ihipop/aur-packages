@@ -1,0 +1,104 @@
+name: Sync Local Changes to AUR
+
+on:
+  push:
+    branches:
+      - master
+  workflow_dispatch:
+    inputs:
+      manual_commit_msg:
+        description: 'AUR 提交信息 (手动干预时必填)'
+        required: true
+        type: string
+
+permissions:
+  contents: read
+
+jobs:
+  sync-local:
+    if: github.actor != 'github-actions[bot]'
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      max-parallel: 1
+      matrix:
+        package:
+          - name: proxyman-bin
+            path: proxyman-bin
+
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+          ref: master
+
+      # 1. Push 触发时运行变动检测
+      - name: Check if package directory changed
+        id: changed-files
+        if: github.event_name == 'push'
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            ${{ matrix.package.path }}/**
+
+      # 2. 核心判定逻辑
+      - name: Determine if sync is needed
+        id: should-sync
+        run: |
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "Manual trigger detected. Forcing sync."
+            echo "sync=true" >> $GITHUB_OUTPUT
+            echo "final_msg=${{ github.event.inputs.manual_commit_msg }}" >> $GITHUB_OUTPUT
+          elif [ "${{ steps.changed-files.outputs.any_changed }}" == "true" ]; then
+            echo "Changes detected in ${{ matrix.package.path }}."
+            echo "sync=true" >> $GITHUB_OUTPUT
+            echo "final_msg=$(git log -1 --pretty=%B)" >> $GITHUB_OUTPUT
+          else
+            echo "No changes, skipping."
+            echo "sync=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Setup SSH for AUR
+        if: steps.should-sync.outputs.sync == 'true'
+        uses: webfactory/ssh-agent@v0.9.0
+        with:
+          ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
+
+      - name: Setup SSH Known Hosts
+        if: steps.should-sync.outputs.sync == 'true'
+        run: |
+          mkdir -p ~/.ssh
+          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+
+      - name: Sync and Push to AUR
+        if: steps.should-sync.outputs.sync == 'true'
+        run: |
+          # 提取最新的提交者信息
+          AUTHOR_NAME=$(git log -1 --pretty="%an")
+          AUTHOR_EMAIL=$(git log -1 --pretty="%ae")
+          AUR_COMMIT_MSG="${{ steps.should-sync.outputs.final_msg }}"
+          
+          AUR_CLONE_DIR="/tmp/aur-repo-${{ matrix.package.name }}"
+          git clone ssh://aur@aur.archlinux.org/${{ matrix.package.name }}.git "$AUR_CLONE_DIR"
+          
+          cd ./${{ matrix.package.path }}
+          # 提取当前包目录下需要同步的物理文件：
+          # -z: 输出以空字符(NUL)分隔 xargs健壮性
+          # -c: 包含已暂存(Cached)的文件
+          # -o: 包含未追踪(Others)的新建文件
+          # --exclude-standard: 自动过滤 .gitignore 声明的无关文件
+          git ls-files -z -c -o --exclude-standard | xargs -0 -r cp -v -t "$AUR_CLONE_DIR/"
+          
+          cd "$AUR_CLONE_DIR"
+          git config user.name "$AUTHOR_NAME"
+          git config user.email "$AUTHOR_EMAIL"
+          git add -A
+          
+          if ! git diff-index --quiet HEAD; then
+            echo "Pushing to AUR with author: $AUTHOR_NAME"
+            git commit -m "$AUR_COMMIT_MSG"
+            git push origin master
+          else
+            echo "No actual changes to commit for AUR."
+          fi
