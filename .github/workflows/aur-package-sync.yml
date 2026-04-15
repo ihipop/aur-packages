@@ -22,6 +22,9 @@ jobs:
   sync-local:
     if: github.actor != 'github-actions[bot]'
     runs-on: ubuntu-latest
+    defaults:
+      run:
+        shell: bash
     strategy:
       fail-fast: false
       max-parallel: 1
@@ -71,12 +74,29 @@ jobs:
                 RANGE="$BEFORE_SHA..$AFTER_SHA"
             fi
             
+            # 提取相关提交并统计数量
+            mapfile -t COMMIT_LIST < <(git log --reverse --format='%h %s' "$RANGE" -- "${{ matrix.package.path }}")
+            COUNT=${#COMMIT_LIST[@]}
+            
+            if [ "$COUNT" -eq 1 ]; then
+              # 单个提交：直接使用原始标题
+              TITLE=$(echo "${COMMIT_LIST[0]}" | cut -d' ' -f2-)
+              BODY=""
+            else
+              # 多个提交：拼接标题，并附带详细列表
+              TITLE=$(git log --reverse --format='%s' "$RANGE" -- "${{ matrix.package.path }}" | paste -sd ';' - | sed 's/;/; /g')
+              BODY=$(echo -e "\nIncluded commits:")
+              for commit in "${COMMIT_LIST[@]}"; do
+                BODY=$(echo -e "$BODY\n- $commit")
+              done
+            fi
+
             {
               echo "final_msg<<EOF"
-              echo "sync ${{ matrix.package.name }} from GitHub"
-              echo ""
-              echo "Included commits:"
-              git log --reverse --format='- %h %s' "$RANGE" -- "${{ matrix.package.path }}"
+              echo "$TITLE"
+              if [ -n "$BODY" ]; then
+                echo "$BODY"
+              fi
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
           else
