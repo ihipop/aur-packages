@@ -32,6 +32,8 @@ jobs:
         package:
           - name: proxyman-bin
             path: packages/proxyman-bin
+          - name: ipinfo-cli-bin
+            path: packages/ipinfo-cli-bin
 
     steps:
       - name: Checkout code
@@ -68,7 +70,12 @@ jobs:
             # 计算变动范围
             BEFORE_SHA="${{ github.event.before }}"
             AFTER_SHA="${{ github.sha }}"
-            if [ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ] || [ -z "$BEFORE_SHA" ]; then
+            
+            # 检查 BEFORE_SHA 是否在当前历史中有效
+            if [ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ] || \
+               [ -z "$BEFORE_SHA" ] || \
+               ! git rev-parse --verify "$BEFORE_SHA" >/dev/null 2>&1; then
+                echo "Before SHA is invalid (force push or first push). Using last commit only."
                 RANGE="HEAD^1..HEAD"
             else
                 RANGE="$BEFORE_SHA..$AFTER_SHA"

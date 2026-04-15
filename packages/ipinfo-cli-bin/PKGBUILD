@@ -2,7 +2,7 @@
 _pkgname=ipinfo-cli
 pkgname="${_pkgname}-bin"
 pkgver=3.3.1
-pkgrel=1
+pkgrel=3
 pkgdesc="Official Command Line Interface for the IPinfo API (IP geolocation and other types of IP data)"
 arch=('x86_64' 'armv7h' 'aarch64')
 url="https://ipinfo.io"
