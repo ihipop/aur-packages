@@ -5,23 +5,100 @@ on:
     - cron: "0 1 * * 1" # Weekly on Monday at 09:00 UTC+8 (01:00 UTC)
   workflow_dispatch:
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: write
+
 jobs:
-  check-update:
+  check-versions:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        package:
+          - name: proxyman-bin
+            path: packages/proxyman-bin
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup nvchecker
+        run: |
+          pip install nvchecker
+
+      - name: Check for new version
+        id: check
+        working-directory: ./${{ matrix.package.path }}
+        env:
+          NVCHECKER_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # 使用 nvchecker 获取最新版本
+          LATEST_VER=$(nvchecker --logger json -c .nvchecker.toml | jq -r 'select(.event == "updated" or .event == "up-to-date") | .version')
+          
+          if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" == "null" ]; then
+            echo "Error: nvchecker failed to find a version."
+            exit 1
+          fi
+          
+          LOCAL_VER=$(grep -P '^\s*pkgver\s*=\s*' .SRCINFO | sed 's/.*= //')
+          
+          if [ "$LATEST_VER" != "$LOCAL_VER" ]; then
+            echo "MATCH=true" >> $GITHUB_ENV
+            # 生成信号文件，包含该包的所有上下文
+            echo "{\"name\": \"${{ matrix.package.name }}\", \"path\": \"${{ matrix.package.path }}\", \"latest\": \"$LATEST_VER\"}" > ../${{ matrix.package.name }}_upd.json
+          else
+            echo "MATCH=false" >> $GITHUB_ENV
+          fi
+
+      - name: Upload Signal
+        if: env.MATCH == 'true'
+        uses: actions/upload-artifact@v4
+        with:
+          name: sig-${{ matrix.package.name }}
+          path: ${{ matrix.package.name }}_upd.json
+          retention-days: 1
+
+  prepare-deploy:
+    needs: check-versions
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.build.outputs.matrix }}
+      any_update: ${{ steps.build.outputs.any_update }}
+    steps:
+      - name: Download all signals
+        uses: actions/download-artifact@v4
+        with:
+          path: signals
+          pattern: sig-*
+          merge-multiple: true
+        continue-on-error: true # 如果没有任何更新，这一步会失败，所以需要忽略
+
+      - name: Build Dynamic Matrix
+        id: build
+        run: |
+          if [ -d "signals" ] && [ "$(ls -A signals)" ]; then
+            JSON=$(cat signals/*.json | jq -s -c '.')
+            echo "matrix=$JSON" >> $GITHUB_OUTPUT
+            echo "any_update=true" >> $GITHUB_OUTPUT
+          else
+            echo "matrix=[]" >> $GITHUB_OUTPUT
+            echo "any_update=false" >> $GITHUB_OUTPUT
+          fi
+
+  deploy-updates:
+    needs: prepare-deploy
+    if: needs.prepare-deploy.outputs.any_update == 'true'
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
     strategy:
       fail-fast: false
-      max-parallel: 1 # 顺序执行
+      max-parallel: 1
       matrix:
-        package:
-          - name: proxyman-bin
-            repo: ProxymanApp/proxyman-windows-linux
-    # defaults:
-    #   run:
-    #     working-directory: ./${{ matrix.package.name }}
+        package: ${{ fromJson(needs.prepare-deploy.outputs.matrix) }}
     steps:
       - name: Install system dependencies
         run: |
@@ -40,35 +117,10 @@ jobs:
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" > /etc/sudoers.d/builder
 
-      - name: Check for new version
-        id: check
-        working-directory: ./${{ matrix.package.name }}
-        run: |
-          LATEST_VER=$(curl -s https://api.github.com/repos/${{ matrix.package.repo }}/releases/latest | jq -r .tag_name)
-          if [ -z "$LATEST_VER" ] || [ "$LATEST_VER" == "null" ]; then
-            echo "Error: Could not fetch latest version from ${{ matrix.package.repo }}"
-            exit 1
-          fi
-          
-          LATEST_VER=${LATEST_VER#[vV]}
-          
-          LOCAL_VER=$(grep -P '^\s*pkgver\s*=\s*' .SRCINFO | sed 's/.*= //')
-          echo "Latest version found: $LATEST_VER"
-          echo "Local version: $LOCAL_VER"
-
-          
-          echo "latest=$LATEST_VER" >> $GITHUB_OUTPUT
-          if [ "$LATEST_VER" != "$LOCAL_VER" ]; then
-            echo "update_needed=true" >> $GITHUB_OUTPUT
-          else
-            echo "update_needed=false" >> $GITHUB_OUTPUT
-          fi
-
       - name: Update PKGBUILD and .SRCINFO
-        if: steps.check.outputs.update_needed == 'true'
-        working-directory: ./${{ matrix.package.name }}
+        working-directory: ./${{ matrix.package.path }}
         run: |
-          sed -i "s/^pkgver=.*/pkgver=${{ steps.check.outputs.latest }}/" PKGBUILD
+          sed -i "s/^pkgver=.*/pkgver=${{ matrix.package.latest }}/" PKGBUILD
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           
           chown -R builder .
@@ -76,53 +128,49 @@ jobs:
           sudo -u builder makepkg --printsrcinfo > .SRCINFO
 
       - name: Setup SSH for AUR
-        if: steps.check.outputs.update_needed == 'true'
         uses: webfactory/ssh-agent@v0.9.0
         with:
           ssh-private-key: ${{ secrets.AUR_SSH_PRIVATE_KEY }}
 
       - name: Setup SSH Known Hosts
-        if: steps.check.outputs.update_needed == 'true'
         run: |
           touch /etc/ssh/ssh_known_hosts
           ssh-keyscan aur.archlinux.org >> /etc/ssh/ssh_known_hosts
-      - name: Commit and Push to GitHub and AUR
-        if: steps.check.outputs.update_needed == 'true'
-        working-directory: ./${{ matrix.package.name }}
+      - name: Commit and Push to AUR and GitHub
+        working-directory: ./${{ matrix.package.path }}
         run: |
-          # 记录当前工作目录 (GitHub Repo 的子目录)
           ORIG_DIR=$(pwd)
-
           git config --global user.name "github-actions[bot]"
           git config --global user.email "github-actions[bot]@users.noreply.github.com"
           git config --global --add safe.directory '*'
 
+          echo "Cloning AUR repository for ${{ matrix.package.name }}..."
+          AUR_CLONE_DIR="/tmp/aur-repo-${{ matrix.package.name }}"
+          git clone ssh://aur@aur.archlinux.org/${{ matrix.package.name }}.git $AUR_CLONE_DIR
+          
+          echo "Syncing PKGBUILD and .SRCINFO to AUR..."
+          cp -av PKGBUILD .SRCINFO "$AUR_CLONE_DIR/"
+          
+          cd $AUR_CLONE_DIR
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
           git add PKGBUILD .SRCINFO
+          
           if ! git diff-index --quiet HEAD; then
-            git commit -m "chore(${{ matrix.package.name }}): update to ${{ steps.check.outputs.latest }}"
-            COMMIT_MADE=true
+            echo "Pushing changes to AUR..."
+            git commit -m "Update to ${{ matrix.package.latest }}"
+            git push origin master
           else
-            COMMIT_MADE=false
+            echo "No changes detected for AUR."
           fi
 
-          if [ "$COMMIT_MADE" = "true" ]; then
-            AUR_CLONE_DIR="/tmp/aur-repo-${{ matrix.package.name }}"
-            echo "Cloning AUR repository for ${{ matrix.package.name }}..."
-            git clone ssh://aur@aur.archlinux.org/${{ matrix.package.name }}.git $AUR_CLONE_DIR
-            
-            echo "Copying files to AUR repository..."
-            git ls-files -z -c -o --exclude-standard | xargs -0 -r cp -v -t "$AUR_CLONE_DIR/"
-            
-            echo "Pushing to AUR..."
-            cd $AUR_CLONE_DIR
-            git add PKGBUILD .SRCINFO
-            if ! git diff-index --quiet HEAD; then
-              git commit -m "Update to ${{ steps.check.outputs.latest }}"
-              git push origin master 
-            fi
-
-            echo "AUR push successful! Now pushing to GitHub..."
-            cd $ORIG_DIR
+          echo "AUR sync successful. Now pushing changes to GitHub..."
+          cd $ORIG_DIR # 回到原工作目录 (package path)
+          git add PKGBUILD .SRCINFO
+          if ! git diff-index --quiet HEAD; then
+            git commit -m "chore(${{ matrix.package.name }}): update to ${{ matrix.package.latest }}"
             git pull --rebase origin master
             git push origin master
+          else
+            echo "No changes to commit for GitHub."
           fi

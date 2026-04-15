@@ -11,6 +11,10 @@ on:
         required: true
         type: string
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
 permissions:
   contents: read
 
@@ -24,7 +28,7 @@ jobs:
       matrix:
         package:
           - name: proxyman-bin
-            path: proxyman-bin
+            path: packages/proxyman-bin
 
     steps:
       - name: Checkout code
@@ -49,11 +53,32 @@ jobs:
           if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
             echo "Manual trigger detected. Forcing sync."
             echo "sync=true" >> $GITHUB_OUTPUT
-            echo "final_msg=${{ github.event.inputs.manual_commit_msg }}" >> $GITHUB_OUTPUT
+            {
+              echo "final_msg<<EOF"
+              echo "${{ github.event.inputs.manual_commit_msg }}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           elif [ "${{ steps.changed-files.outputs.any_changed }}" == "true" ]; then
             echo "Changes detected in ${{ matrix.package.path }}."
             echo "sync=true" >> $GITHUB_OUTPUT
-            echo "final_msg=$(git log -1 --pretty=%B)" >> $GITHUB_OUTPUT
+            
+            # 计算变动范围
+            BEFORE_SHA="${{ github.event.before }}"
+            AFTER_SHA="${{ github.sha }}"
+            if [ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ] || [ -z "$BEFORE_SHA" ]; then
+                RANGE="HEAD^1..HEAD"
+            else
+                RANGE="$BEFORE_SHA..$AFTER_SHA"
+            fi
+            
+            {
+              echo "final_msg<<EOF"
+              echo "sync ${{ matrix.package.name }} from GitHub"
+              echo ""
+              echo "Included commits:"
+              git log --reverse --format='- %h %s' "$RANGE" -- "${{ matrix.package.path }}"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
           else
             echo "No changes, skipping."
             echo "sync=false" >> $GITHUB_OUTPUT
@@ -83,13 +108,15 @@ jobs:
           git clone ssh://aur@aur.archlinux.org/${{ matrix.package.name }}.git "$AUR_CLONE_DIR"
           
           cd ./${{ matrix.package.path }}
-          # 提取当前包目录下需要同步的物理文件：
-          # -z: 输出以空字符(NUL)分隔 xargs健壮性
-          # -c: 包含已暂存(Cached)的文件
-          # -o: 包含未追踪(Others)的新建文件
-          # --exclude-standard: 自动过滤 .gitignore 声明的无关文件
-          git ls-files -z -c -o --exclude-standard | xargs -0 -r cp -v -t "$AUR_CLONE_DIR/"
-          
+          # 使用 rsync 进行镜像同步，--delete 确保 AUR 侧多余的文件被清理
+          rsync -av --delete --exclude=".git/" ./ "$AUR_CLONE_DIR/"
+          # 拷贝并合并 .gitignore (全局在前，本地在后，确保本地规则优先级更高)
+          cp "$GITHUB_WORKSPACE/packages/.gitignore" "$AUR_CLONE_DIR/.gitignore"
+          if [ -f ".gitignore" ]; then
+            echo -e "\n# --- Package Specific Rules ---" >> "$AUR_CLONE_DIR/.gitignore"
+            cat ".gitignore" >> "$AUR_CLONE_DIR/.gitignore"
+          fi
+         
           cd "$AUR_CLONE_DIR"
           git config user.name "$AUTHOR_NAME"
           git config user.email "$AUTHOR_EMAIL"
