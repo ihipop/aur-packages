@@ -16,12 +16,16 @@ concurrency:
   cancel-in-progress: false
 
 permissions:
-  contents: read
+  contents: write
 
 jobs:
   sync-local:
-    if: github.actor != 'github-actions[bot]'
+    if: |
+      github.actor != 'github-actions[bot]' && 
+      !contains(github.event.head_commit.message, '[skip ci]')
     runs-on: ubuntu-latest
+    container:
+      image: archlinux:latest
     defaults:
       run:
         shell: bash
@@ -36,13 +40,23 @@ jobs:
             path: packages/ipinfo-cli-bin
 
     steps:
+      - name: Install system dependencies
+        run: |
+          pacman -Sy --noconfirm archlinux-keyring ca-certificates
+          pacman -Syu --noconfirm git openssh curl jq binutils fakeroot pacman-contrib rsync sudo
+          git config --global --add safe.directory "*"
+          useradd -m builder
+          echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
+
       - name: Checkout code
         uses: actions/checkout@v4
         with:
           fetch-depth: 0
           ref: master
+          # 回推 GitHub
+          token: ${{ secrets.GITHUB_TOKEN }}
 
-      # 1. Push 触发时运行变动检测
+      # Push 触发时运行变动检测
       - name: Check if package directory changed
         id: changed-files
         if: github.event_name == 'push'
@@ -51,7 +65,7 @@ jobs:
           files: |
             ${{ matrix.package.path }}/**
 
-      # 2. 核心判定逻辑
+      # 判定是否变化的逻辑
       - name: Determine if sync is needed
         id: should-sync
         run: |
@@ -67,31 +81,25 @@ jobs:
             echo "Changes detected in ${{ matrix.package.path }}."
             echo "sync=true" >> $GITHUB_OUTPUT
             
-            # 计算变动范围
-            BEFORE_SHA="${{ github.event.before }}"
-            AFTER_SHA="${{ github.sha }}"
+            # 使用更健壮的方式从原始事件 JSON 文件解析提交信息
+            echo "Debug: Searching commits for path [${{ matrix.package.path }}]"
+            mapfile -t COMMIT_LIST < <(jq -r ".commits[] | 
+              select((.added + .modified + .removed)[] | startswith(\"${{ matrix.package.path }}\")) | 
+              \"\(.id[0:7]) \(.message | split(\"\n\")[0])\"" "$GITHUB_EVENT_PATH" | sort -u)
             
-            # 检查 BEFORE_SHA 是否在当前历史中有效
-            if [ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ] || \
-               [ -z "$BEFORE_SHA" ] || \
-               ! git rev-parse --verify "$BEFORE_SHA" >/dev/null 2>&1; then
-                echo "Before SHA is invalid (force push or first push). Using last commit only."
-                RANGE="HEAD^1..HEAD"
-            else
-                RANGE="$BEFORE_SHA..$AFTER_SHA"
-            fi
-            
-            # 提取相关提交并统计数量
-            mapfile -t COMMIT_LIST < <(git log --reverse --format='%h %s' "$RANGE" -- "${{ matrix.package.path }}")
             COUNT=${#COMMIT_LIST[@]}
             
-            if [ "$COUNT" -eq 1 ]; then
-              # 单个提交：直接使用原始标题
+            if [ "$COUNT" -eq 0 ]; then
+               # 回退到简单的 git log
+               TITLE="sync ${{ matrix.package.name }} from GitHub"
+               BODY=""
+            elif [ "$COUNT" -eq 1 ]; then
+              # 单个提交
               TITLE=$(echo "${COMMIT_LIST[0]}" | cut -d' ' -f2-)
               BODY=""
             else
-              # 多个提交：拼接标题，并附带详细列表
-              TITLE=$(git log --reverse --format='%s' "$RANGE" -- "${{ matrix.package.path }}" | paste -sd ';' - | sed 's/;/; /g')
+              # 多个提交：合并标题，并列出清单
+              TITLE=$(printf "%s\n" "${COMMIT_LIST[@]}" | cut -d' ' -f2- | paste -sd ';' - | sed 's/;/; /g')
               BODY=$(echo -e "\nIncluded commits:")
               for commit in "${COMMIT_LIST[@]}"; do
                 BODY=$(echo -e "$BODY\n- $commit")
@@ -111,6 +119,15 @@ jobs:
             echo "sync=false" >> $GITHUB_OUTPUT
           fi
 
+      # 自动修复校验和与 .SRCINFO
+      - name: Auto-fix checksums and .SRCINFO
+        if: steps.should-sync.outputs.sync == 'true'
+        run: |
+          chown -R builder:builder .
+          cd ./${{ matrix.package.path }}
+          sudo -u builder updpkgsums
+          sudo -u builder makepkg --printsrcinfo > .SRCINFO
+
       - name: Setup SSH for AUR
         if: steps.should-sync.outputs.sync == 'true'
         uses: webfactory/ssh-agent@v0.9.0
@@ -120,9 +137,10 @@ jobs:
       - name: Setup SSH Known Hosts
         if: steps.should-sync.outputs.sync == 'true'
         run: |
-          mkdir -p ~/.ssh
-          ssh-keyscan aur.archlinux.org >> ~/.ssh/known_hosts
+          touch /etc/ssh/ssh_known_hosts
+          ssh-keyscan aur.archlinux.org >> /etc/ssh/ssh_known_hosts
 
+      # 同步并推送到 AUR
       - name: Sync and Push to AUR
         if: steps.should-sync.outputs.sync == 'true'
         run: |
@@ -155,4 +173,19 @@ jobs:
             git push origin master
           else
             echo "No actual changes to commit for AUR."
+          fi
+
+          git config --global user.name "github-actions[bot]"
+          git config --global user.email "github-actions[bot]@users.noreply.github.com"
+          
+          cd "$GITHUB_WORKSPACE"
+          # 检查是否有文件改动
+          if ! git diff --quiet ./${{ matrix.package.path }}; then
+            echo "Detected changes. Pushing back to GitHub with [skip ci]..."
+            git add ./${{ matrix.package.path }}
+            git commit -m "chore(${{ matrix.package.name }}): auto-fix [skip ci]"
+            git pull --rebase origin master
+            git push origin master
+          else
+            echo "No changes needed."
           fi
