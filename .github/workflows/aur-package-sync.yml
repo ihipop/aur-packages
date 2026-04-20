@@ -42,8 +42,8 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          pacman -Sy --noconfirm archlinux-keyring ca-certificates
-          pacman -Syu --noconfirm git openssh curl jq binutils fakeroot pacman-contrib rsync sudo
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed base-devel git openssh curl jq pacman-contrib rsync sudo
           git config --global --add safe.directory "*"
           useradd -m builder
           echo "builder ALL=(ALL) NOPASSWD: ALL" >> /etc/sudoers
@@ -124,13 +124,20 @@ jobs:
             echo "sync=false" >> $GITHUB_OUTPUT
           fi
 
-      # 自动修复校验和与 .SRCINFO
-      - name: Auto-fix checksums and .SRCINFO
+      # 自动修复校验和与 .SRCINFO 并进行构建测试
+      - name: Build test and Update .SRCINFO
         if: steps.should-sync.outputs.sync == 'true'
         run: |
           chown -R builder:builder .
           cd ./${{ matrix.package.path }}
+          
+          echo "Updating checksums..."
           sudo -u builder updpkgsums
+          
+          echo "Running build test (makepkg)..."
+          sudo -u builder makepkg -s --noconfirm --noprogressbar
+          
+          echo "Generating .SRCINFO..."
           sudo -u builder makepkg --printsrcinfo > .SRCINFO
 
       - name: Setup SSH for AUR

@@ -113,8 +113,8 @@ jobs:
     steps:
       - name: Install system dependencies
         run: |
-          pacman -Sy --noconfirm archlinux-keyring ca-certificates
-          pacman -Syu --noconfirm git openssh curl jq binutils fakeroot pacman-contrib sudo
+          pacman -Sy --noconfirm archlinux-keyring
+          pacman -Syu --noconfirm --needed base-devel git openssh curl jq pacman-contrib sudo
 
       - name: Checkout code
         uses: actions/checkout@v4
@@ -135,7 +135,14 @@ jobs:
           sed -i "s/^pkgrel=.*/pkgrel=1/" PKGBUILD
           
           chown -R builder .
+          echo "Updating checksums..."
           sudo -u builder updpkgsums
+          
+          echo "Running build test (makepkg)..."
+          # -s: install missing dependencies, --noconfirm: do not ask for confirmation
+          sudo -u builder makepkg -s --noconfirm --noprogressbar
+          
+          echo "Generating .SRCINFO..."
           sudo -u builder makepkg --printsrcinfo > .SRCINFO
 
       - name: Setup SSH for AUR
