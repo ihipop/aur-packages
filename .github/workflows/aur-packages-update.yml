@@ -4,6 +4,11 @@ on:
   schedule:
     - cron: "0 1 * * 1" # Weekly on Monday at 09:00 UTC+8 (01:00 UTC)
   workflow_dispatch:
+    inputs:
+      packages:
+        description: '指定的包名（逗号分隔，留空则检查所有）'
+        required: false
+        default: ''
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -40,6 +45,17 @@ jobs:
         env:
           NVCHECKER_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
+          # 如果手动触发并指定了包，进行过滤
+          SELECTED_PACKAGES="${{ github.event.inputs.packages }}"
+          if [ -n "$SELECTED_PACKAGES" ]; then
+            SELECTED_PACKAGES=$(echo "$SELECTED_PACKAGES" | sed 's/ //g')
+            if [[ ! ",$SELECTED_PACKAGES," =~ ",${{ matrix.package.name }}," ]]; then
+              echo "跳过 ${{ matrix.package.name }}，未在指定列表中。"
+              echo "MATCH=false" >> $GITHUB_ENV
+              exit 0
+            fi
+          fi
+
           # 使用 nvchecker 获取最新版本
           LATEST_VER=$(nvchecker --logger json -c .nvchecker.toml | jq -r 'select(.event == "updated" or .event == "up-to-date") | .version')
           
@@ -53,7 +69,7 @@ jobs:
           if [ "$LATEST_VER" != "$LOCAL_VER" ]; then
             echo "MATCH=true" >> $GITHUB_ENV
             # 生成信号文件，包含该包的所有上下文
-            echo "{\"name\": \"${{ matrix.package.name }}\", \"path\": \"${{ matrix.package.path }}\", \"latest\": \"$LATEST_VER\"}" > ../${{ matrix.package.name }}_upd.json
+            echo "{\"name\": \"${{ matrix.package.name }}\", \"path\": \"${{ matrix.package.path }}\", \"latest\": \"$LATEST_VER\"}" > ${{ matrix.package.name }}_upd.json
           else
             echo "MATCH=false" >> $GITHUB_ENV
           fi
@@ -63,7 +79,7 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: sig-${{ matrix.package.name }}
-          path: ${{ matrix.package.name }}_upd.json
+          path: ${{ matrix.package.path }}/${{ matrix.package.name }}_upd.json
           retention-days: 1
 
   prepare-deploy:
