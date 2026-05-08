@@ -126,6 +126,9 @@ jobs:
             
             # 使用更健壮的方式从原始事件 JSON 文件解析提交信息
             echo "Debug: Searching commits for path [${{ matrix.package.path }}]"
+            echo "Debug: All files in event commits:"
+            jq -r '.commits // [] | .[] | (.added + .modified + .removed)[]' "$GITHUB_EVENT_PATH" | sort -u
+            
             mapfile -t COMMIT_LIST < <(jq -r '
               .commits // [] | .[] | 
               select(
