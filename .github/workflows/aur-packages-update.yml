@@ -18,7 +18,49 @@ permissions:
   contents: write
 
 jobs:
+  setup-matrix:
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - id: set-matrix
+        run: |
+          cd packages
+          JSON="["
+          for dir in *; do
+            if [ -d "$dir" ] && [ -f "$dir/.nvchecker.toml" ]; then
+              JSON="$JSON{\"name\": \"$dir\", \"path\": \"packages/$dir\"},"
+            fi
+          done
+          JSON="${JSON%,}]"
+          
+          INPUT_PACKAGES="${{ github.event.inputs.packages }}"
+          
+          if [ -n "$INPUT_PACKAGES" ]; then
+            FILTERED=$(echo "$JSON" | jq -c --arg list "$INPUT_PACKAGES" '
+              [ .[] | select(.name as $name | $list | split(",") | map(gsub(" "; "")) | contains([$name])) ]
+            ')
+            echo "matrix=$FILTERED" >> $GITHUB_OUTPUT
+            if [ "$FILTERED" = "[]" ]; then
+              echo "has_packages=false" >> $GITHUB_OUTPUT
+            else
+              echo "has_packages=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            echo "matrix=$JSON" >> $GITHUB_OUTPUT
+            if [ "$JSON" = "[]" ]; then
+              echo "has_packages=false" >> $GITHUB_OUTPUT
+            else
+              echo "has_packages=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
   check-versions:
+    needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_packages == 'true' }}
     runs-on: ubuntu-latest
     defaults:
       run:
@@ -26,11 +68,7 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        package:
-          - name: proxyman-bin
-            path: packages/proxyman-bin
-          - name: ipinfo-cli-bin
-            path: packages/ipinfo-cli-bin
+        package: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
@@ -45,17 +83,6 @@ jobs:
         env:
           NVCHECKER_GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          # 如果手动触发并指定了包，进行过滤
-          SELECTED_PACKAGES="${{ github.event.inputs.packages }}"
-          if [ -n "$SELECTED_PACKAGES" ]; then
-            SELECTED_PACKAGES=$(echo "$SELECTED_PACKAGES" | sed 's/ //g')
-            if [[ ! ",$SELECTED_PACKAGES," =~ ",${{ matrix.package.name }}," ]]; then
-              echo "跳过 ${{ matrix.package.name }}，未在指定列表中。"
-              echo "MATCH=false" >> $GITHUB_ENV
-              exit 0
-            fi
-          fi
-
           # 使用 nvchecker 获取最新版本
           LATEST_VER=$(nvchecker --logger json -c .nvchecker.toml | jq -r 'select(.event == "updated" or .event == "up-to-date") | .version')
           
