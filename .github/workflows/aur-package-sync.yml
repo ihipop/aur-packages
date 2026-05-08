@@ -19,10 +19,64 @@ permissions:
   contents: write
 
 jobs:
-  sync-local:
+  setup-matrix:
     if: |
       github.actor != 'github-actions[bot]' && 
       !contains(github.event.head_commit.message, '[skip ci]')
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.set-matrix.outputs.matrix }}
+      has_packages: ${{ steps.set-matrix.outputs.has_packages }}
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Get changed files
+        id: changed-files
+        uses: tj-actions/changed-files@v44
+        with:
+          files: |
+            packages/**
+
+      - id: set-matrix
+        run: |
+          cd packages
+          JSON="["
+          for dir in *; do
+            if [ -d "$dir" ] && [ -f "$dir/.nvchecker.toml" ]; then
+              JSON="$JSON{\"name\": \"$dir\", \"path\": \"packages/$dir\"},"
+            fi
+          done
+          JSON="${JSON%,}]"
+          cd ..
+          
+          CHANGED_FILES="${{ steps.changed-files.outputs.all_changed_files }}"
+          
+          if [ "${{ github.event_name }}" == "workflow_dispatch" ]; then
+            echo "matrix=$JSON" >> $GITHUB_OUTPUT
+            echo "has_packages=true" >> $GITHUB_OUTPUT
+          else
+            FILTERED="["
+            for dir in $(echo "$JSON" | jq -r '.[] | .name'); do
+              if echo "$CHANGED_FILES" | grep -q "packages/$dir/"; then
+                FILTERED="$FILTERED{\"name\": \"$dir\", \"path\": \"packages/$dir\"},"
+              fi
+            done
+            FILTERED="${FILTERED%,}]"
+            
+            echo "matrix=$FILTERED" >> $GITHUB_OUTPUT
+            if [ "$FILTERED" = "[]" ]; then
+              echo "has_packages=false" >> $GITHUB_OUTPUT
+            else
+              echo "has_packages=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+  sync-local:
+    needs: setup-matrix
+    if: ${{ needs.setup-matrix.outputs.has_packages == 'true' }}
     runs-on: ubuntu-latest
     container:
       image: archlinux:latest
@@ -33,11 +87,7 @@ jobs:
       fail-fast: false
       max-parallel: 1
       matrix:
-        package:
-          - name: proxyman-bin
-            path: packages/proxyman-bin
-          - name: ipinfo-cli-bin
-            path: packages/ipinfo-cli-bin
+        package: ${{ fromJson(needs.setup-matrix.outputs.matrix) }}
 
     steps:
       - name: Install system dependencies
@@ -56,14 +106,6 @@ jobs:
           # 回推 GitHub
           token: ${{ secrets.GITHUB_TOKEN }}
 
-      # Push 触发时运行变动检测
-      - name: Check if package directory changed
-        id: changed-files
-        if: github.event_name == 'push'
-        uses: tj-actions/changed-files@v44
-        with:
-          files: |
-            ${{ matrix.package.path }}/**
 
       # 判定是否变化的逻辑
       - name: Determine if sync is needed
@@ -78,7 +120,7 @@ jobs:
               echo "${{ github.event.inputs.manual_commit_msg }}"
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-          elif [ "${{ steps.changed-files.outputs.any_changed }}" == "true" ]; then
+          else
             echo "Changes detected in ${{ matrix.package.path }}."
             echo "sync=true" >> $GITHUB_OUTPUT
             
