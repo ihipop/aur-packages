@@ -164,9 +164,6 @@ jobs:
               fi
               echo "EOF"
             } >> "$GITHUB_OUTPUT"
-          else
-            echo "No changes, skipping."
-            echo "sync=false" >> $GITHUB_OUTPUT
           fi
 
       # 自动修复校验和与 .SRCINFO 并进行构建测试
